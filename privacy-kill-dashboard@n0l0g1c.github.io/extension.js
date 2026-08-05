@@ -14,13 +14,13 @@ import * as PanelMenu from 'resource:///org/gnome/shell/ui/panelMenu.js';
 import * as PopupMenu from 'resource:///org/gnome/shell/ui/popupMenu.js';
 import * as Volume from 'resource:///org/gnome/shell/ui/status/volume.js';
 
+Gio._promisify(Gio.File.prototype, 'load_contents_async', 'load_contents_finish');
+Gio._promisify(Gio.File.prototype, 'replace_contents_async', 'replace_contents_finish');
+
 const POLL_MS = 2000;
 const CONFIG_DIR = 'privacy-kill-dashboard';
 const CONFIG_FILE = 'settings.json';
 
-/**
- * @returns {string}
- */
 function configPath() {
     return GLib.build_filenamev([
         GLib.get_user_config_dir(),
@@ -29,35 +29,31 @@ function configPath() {
     ]);
 }
 
-/**
- * @returns {{killSwitchArmed: boolean}}
- */
-function loadConfig() {
-    const defaults = {killSwitchArmed: false};
+function defaultConfig() {
+    return {killSwitchArmed: false};
+}
+
+async function loadConfig() {
+    const defaults = defaultConfig();
     try {
         const file = Gio.File.new_for_path(configPath());
         if (!file.query_exists(null))
             return defaults;
-        const [, bytes] = file.load_contents(null);
+        const [, bytes] = await file.load_contents_async(null);
         const data = JSON.parse(new TextDecoder().decode(bytes));
-        return {
-            killSwitchArmed: !!data.killSwitchArmed,
-        };
+        return {killSwitchArmed: !!data.killSwitchArmed};
     } catch {
         return defaults;
     }
 }
 
-/**
- * @param {{killSwitchArmed: boolean}} cfg
- */
-function saveConfig(cfg) {
+async function saveConfig(cfg) {
     try {
         const file = Gio.File.new_for_path(configPath());
         const dir = file.get_parent();
         if (dir && !dir.query_exists(null))
             dir.make_directory_with_parents(null);
-        file.replace_contents(
+        await file.replace_contents_async(
             new TextEncoder().encode(JSON.stringify(cfg, null, 2)),
             null,
             false,
@@ -69,11 +65,6 @@ function saveConfig(cfg) {
     }
 }
 
-/**
- * @param {string} key
- * @param {string} value
- * @param {string} [style]
- */
 class StatusRow extends PopupMenu.PopupBaseMenuItem {
     static {
         GObject.registerClass(this);
@@ -102,10 +93,6 @@ class StatusRow extends PopupMenu.PopupBaseMenuItem {
         this.add_child(this._val);
     }
 
-    /**
-     * @param {string} text
-     * @param {string} [style]
-     */
     setValue(text, style = '') {
         this._val.text = text;
         this._val.style_class = `pkd-val ${style}`.trim();
@@ -139,7 +126,7 @@ class PrivacyKillIndicator extends PanelMenu.Button {
 
         this.add_child(box);
 
-        this._cfg = loadConfig();
+        this._cfg = defaultConfig();
         this._hadVpn = false;
         this._pollSource = 0;
         this._nmClient = null;
@@ -151,7 +138,9 @@ class PrivacyKillIndicator extends PanelMenu.Button {
         this._privacyChangedIds = [];
 
         try {
-            this._privacy = new Gio.Settings({
+            // system schema org.gnome.desktop.privacy (not an extension schema)
+            const Settings = Gio.Settings;
+            this._privacy = new Settings({
                 schema_id: 'org.gnome.desktop.privacy',
             });
         } catch (e) {
@@ -205,7 +194,7 @@ class PrivacyKillIndicator extends PanelMenu.Button {
         this._armItem = new PopupMenu.PopupMenuItem(this._armLabel());
         this._armItem.connect('activate', () => {
             this._cfg.killSwitchArmed = !this._cfg.killSwitchArmed;
-            saveConfig(this._cfg);
+            saveConfig(this._cfg).catch(e => logError(e));
             this._armItem.label.text = this._armLabel();
             this._refresh();
             if (this._cfg.killSwitchArmed) {
@@ -256,6 +245,9 @@ class PrivacyKillIndicator extends PanelMenu.Button {
     }
 
     async start() {
+        this._cfg = await loadConfig();
+        this._armItem.label.text = this._armLabel();
+
         try {
             this._nmClient = await NM.Client.new_async(null);
             this._nmSignalIds.push(
@@ -281,7 +273,11 @@ class PrivacyKillIndicator extends PanelMenu.Button {
 
     destroy() {
         if (this._pollSource) {
-            try { GLib.Source.remove(this._pollSource); } catch { /* already removed */ }
+            try {
+                GLib.Source.remove(this._pollSource);
+            } catch {
+                // already gone
+            }
             this._pollSource = 0;
         }
         if (this._mixerControl && this._streamChangedId) {
@@ -305,16 +301,14 @@ class PrivacyKillIndicator extends PanelMenu.Button {
         super.destroy();
     }
 
-    /**
-     * @returns {boolean}
-     */
     _vpnActive() {
         if (!this._nmClient)
             return false;
+
         const connections = this._nmClient.get_active_connections() || [];
         for (const ac of connections) {
             const type = ac.get_connection_type?.() || ac.connection_type || '';
-            // VPN, WireGuard (NM treats wg as VPN or wireguard depending on version)
+            // NM versions differ on how wireguard is reported
             if (type === 'vpn' || type === 'wireguard' || type.includes('vpn'))
                 return true;
             const id = (ac.get_id?.() || ac.id || '').toLowerCase();
@@ -322,7 +316,7 @@ class PrivacyKillIndicator extends PanelMenu.Button {
                 id.includes('tailscale') || id.includes('mullvad') || id.includes('proton'))
                 return true;
         }
-        // Also treat tailscale0 / wg* interfaces via NM devices
+
         const devices = this._nmClient.get_devices?.() || [];
         for (const dev of devices) {
             const iface = dev.get_iface?.() || dev.interface || '';
@@ -337,9 +331,8 @@ class PrivacyKillIndicator extends PanelMenu.Button {
 
     _onNmChange() {
         const vpn = this._vpnActive();
-        if (this._cfg.killSwitchArmed && this._hadVpn && !vpn) {
+        if (this._cfg.killSwitchArmed && this._hadVpn && !vpn)
             this._triggerKillSwitch();
-        }
         this._hadVpn = vpn;
     }
 
@@ -352,9 +345,6 @@ class PrivacyKillIndicator extends PanelMenu.Button {
         this._statusItem.label.text = 'Kill-switch fired — networking disabled';
     }
 
-    /**
-     * @param {boolean} enabled
-     */
     _setNetworking(enabled) {
         if (!this._nmClient) {
             Main.notify('Privacy Kill Dashboard', 'NetworkManager not available');
@@ -390,9 +380,6 @@ class PrivacyKillIndicator extends PanelMenu.Button {
         }
     }
 
-    /**
-     * @param {'disable-camera'|'disable-microphone'} key
-     */
     _togglePrivacyKey(key) {
         if (!this._privacy) {
             Main.notify('Privacy Kill Dashboard', 'Privacy settings unavailable');
@@ -408,7 +395,6 @@ class PrivacyKillIndicator extends PanelMenu.Button {
     }
 
     _refresh() {
-        // Microphone mute state
         let micMuted = null;
         try {
             const stream = this._inputStream ||
@@ -419,15 +405,13 @@ class PrivacyKillIndicator extends PanelMenu.Button {
             // ignore
         }
 
-        if (micMuted === null) {
+        if (micMuted === null)
             this._micRow.setValue('unknown', 'pkd-warn');
-        } else if (micMuted) {
+        else if (micMuted)
             this._micRow.setValue('muted', 'pkd-ok');
-        } else {
+        else
             this._micRow.setValue('live (unmuted)', 'pkd-danger');
-        }
 
-        // Privacy locks
         let camLocked = null;
         let micLocked = null;
         if (this._privacy) {
@@ -471,13 +455,11 @@ class PrivacyKillIndicator extends PanelMenu.Button {
                 netOn ? 'ARMED' : 'ARMED · net OFF',
                 'pkd-armed'
             );
-            this._armItem.label.text = this._armLabel();
         } else {
             this._ksRow.setValue(netOn ? 'disarmed' : 'disarmed · net OFF', '');
-            this._armItem.label.text = this._armLabel();
         }
+        this._armItem.label.text = this._armLabel();
 
-        // Panel summary
         const bits = [];
         if (micMuted === false)
             bits.push('MIC');
@@ -505,10 +487,6 @@ class PrivacyKillIndicator extends PanelMenu.Button {
 }
 
 export default class PrivacyKillDashboardExtension extends Extension {
-    /**
-     * @param {string} role
-     * @param {import('resource:///org/gnome/shell/ui/panelMenu.js').Button} indicator
-     */
     _addToPanel(role, indicator) {
         const existing = Main.panel.statusArea[role];
         if (existing) {
