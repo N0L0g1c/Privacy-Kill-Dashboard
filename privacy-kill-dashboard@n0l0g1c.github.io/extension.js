@@ -505,23 +505,31 @@ class PrivacyKillIndicator extends PanelMenu.Button {
 }
 
 export default class PrivacyKillDashboardExtension extends Extension {
+    /**
+     * @param {string} role
+     * @param {import('resource:///org/gnome/shell/ui/panelMenu.js').Button} indicator
+     */
+    _addToPanel(role, indicator) {
+        try {
+            Main.panel.addToStatusArea(role, indicator);
+        } catch {
+            try {
+                Main.panel.statusArea[role]?.destroy();
+            } catch {
+                // ignore
+            }
+            Main.panel.addToStatusArea(role, indicator);
+        }
+    }
+
     enable() {
-        this.disable();
         this._indicator = new PrivacyKillIndicator();
-        Main.panel.addToStatusArea(this.uuid, this._indicator);
+        this._addToPanel(this.uuid, this._indicator);
         this._indicator.start().catch(e => logError(e));
     }
 
     disable() {
         this._indicator?.destroy();
         this._indicator = null;
-        const leftover = Main.panel.statusArea[this.uuid];
-        if (leftover) {
-            try {
-                leftover.destroy();
-            } catch {
-                // already destroyed
-            }
-        }
     }
 }
