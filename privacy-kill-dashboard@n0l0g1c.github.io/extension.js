@@ -137,29 +137,19 @@ class PrivacyKillIndicator extends PanelMenu.Button {
         this._streamChangedId = 0;
         this._privacyChangedIds = [];
 
-        try {
-            // system schema org.gnome.desktop.privacy (not an extension schema)
-            const Settings = Gio.Settings;
-            this._privacy = new Settings({
-                schema_id: 'org.gnome.desktop.privacy',
-            });
-        } catch (e) {
-            logError(e, 'Privacy Kill Dashboard: privacy settings unavailable');
-        }
+        this._privacy = new Gio.Settings({
+            schema_id: 'org.gnome.desktop.privacy',
+        });
 
-        try {
-            this._mixerControl = Volume.getMixerControl();
-            this._inputStream = this._mixerControl.get_default_source();
-            this._streamChangedId = this._mixerControl.connect(
-                'default-source-changed',
-                () => {
-                    this._inputStream = this._mixerControl.get_default_source();
-                    this._refresh();
-                }
-            );
-        } catch (e) {
-            logError(e, 'Privacy Kill Dashboard: mixer unavailable');
-        }
+        this._mixerControl = Volume.getMixerControl();
+        this._inputStream = this._mixerControl.get_default_source();
+        this._streamChangedId = this._mixerControl.connect(
+            'default-source-changed',
+            () => {
+                this._inputStream = this._mixerControl.get_default_source();
+                this._refresh();
+            }
+        );
 
         this._micRow = new StatusRow('Microphone', '…');
         this._camRow = new StatusRow('Camera lock', '…');
@@ -273,11 +263,7 @@ class PrivacyKillIndicator extends PanelMenu.Button {
 
     destroy() {
         if (this._pollSource) {
-            try {
-                GLib.Source.remove(this._pollSource);
-            } catch {
-                // already gone
-            }
+            GLib.Source.remove(this._pollSource);
             this._pollSource = 0;
         }
         if (this._mixerControl && this._streamChangedId) {
@@ -305,24 +291,20 @@ class PrivacyKillIndicator extends PanelMenu.Button {
         if (!this._nmClient)
             return false;
 
-        const connections = this._nmClient.get_active_connections() || [];
-        for (const ac of connections) {
-            const type = ac.get_connection_type?.() || ac.connection_type || '';
-            // NM versions differ on how wireguard is reported
+        for (const ac of this._nmClient.get_active_connections()) {
+            const type = ac.get_connection_type() || '';
             if (type === 'vpn' || type === 'wireguard' || type.includes('vpn'))
                 return true;
-            const id = (ac.get_id?.() || ac.id || '').toLowerCase();
+            const id = (ac.get_id() || '').toLowerCase();
             if (id.includes('vpn') || id.includes('wireguard') || id.includes('wg-') ||
                 id.includes('tailscale') || id.includes('mullvad') || id.includes('proton'))
                 return true;
         }
 
-        const devices = this._nmClient.get_devices?.() || [];
-        for (const dev of devices) {
-            const iface = dev.get_iface?.() || dev.interface || '';
-            const state = dev.get_state?.() || dev.state;
-            if (!iface || state !== NM.DeviceState.ACTIVATED)
+        for (const dev of this._nmClient.get_devices()) {
+            if (dev.get_state() !== NM.DeviceState.ACTIVATED)
                 continue;
+            const iface = dev.get_iface() || '';
             if (iface === 'tailscale0' || iface.startsWith('wg') || iface.startsWith('tun'))
                 return true;
         }
@@ -350,60 +332,32 @@ class PrivacyKillIndicator extends PanelMenu.Button {
             Main.notify('Privacy Kill Dashboard', 'NetworkManager not available');
             return;
         }
-        try {
-            this._nmClient.networking_set_enabled(enabled);
-            this._statusItem.label.text = enabled
-                ? 'Networking enabled'
-                : 'Networking disabled';
-            this._refresh();
-        } catch (e) {
-            logError(e, 'Privacy Kill Dashboard: networking_set_enabled failed');
-            Main.notify(
-                'Privacy Kill Dashboard',
-                `Could not ${enabled ? 'enable' : 'disable'} networking`
-            );
-        }
+        this._nmClient.networking_set_enabled(enabled);
+        this._statusItem.label.text = enabled
+            ? 'Networking enabled'
+            : 'Networking disabled';
+        this._refresh();
     }
 
     _toggleMicMute() {
-        try {
-            const stream = this._inputStream ||
-                this._mixerControl?.get_default_source?.();
-            if (!stream) {
-                Main.notify('Privacy Kill Dashboard', 'No input device found');
-                return;
-            }
-            stream.change_is_muted(!stream.is_muted);
-            this._refresh();
-        } catch (e) {
-            logError(e, 'Privacy Kill Dashboard: mic mute failed');
+        const stream = this._inputStream || this._mixerControl.get_default_source();
+        if (!stream) {
+            Main.notify('Privacy Kill Dashboard', 'No input device found');
+            return;
         }
+        stream.change_is_muted(!stream.is_muted);
+        this._refresh();
     }
 
     _togglePrivacyKey(key) {
-        if (!this._privacy) {
-            Main.notify('Privacy Kill Dashboard', 'Privacy settings unavailable');
-            return;
-        }
-        try {
-            const cur = this._privacy.get_boolean(key);
-            this._privacy.set_boolean(key, !cur);
-            this._refresh();
-        } catch (e) {
-            logError(e, `Privacy Kill Dashboard: toggle ${key} failed`);
-        }
+        const cur = this._privacy.get_boolean(key);
+        this._privacy.set_boolean(key, !cur);
+        this._refresh();
     }
 
     _refresh() {
-        let micMuted = null;
-        try {
-            const stream = this._inputStream ||
-                this._mixerControl?.get_default_source?.();
-            if (stream)
-                micMuted = !!stream.is_muted;
-        } catch {
-            // ignore
-        }
+        const stream = this._inputStream || this._mixerControl.get_default_source();
+        const micMuted = stream ? !!stream.is_muted : null;
 
         if (micMuted === null)
             this._micRow.setValue('unknown', 'pkd-warn');
@@ -412,24 +366,16 @@ class PrivacyKillIndicator extends PanelMenu.Button {
         else
             this._micRow.setValue('live (unmuted)', 'pkd-danger');
 
-        let camLocked = null;
-        let micLocked = null;
-        if (this._privacy) {
-            try {
-                camLocked = this._privacy.get_boolean('disable-camera');
-                micLocked = this._privacy.get_boolean('disable-microphone');
-            } catch {
-                // ignore
-            }
-        }
+        const camLocked = this._privacy.get_boolean('disable-camera');
+        const micLocked = this._privacy.get_boolean('disable-microphone');
 
         this._camRow.setValue(
-            camLocked === null ? 'n/a' : camLocked ? 'locked' : 'allowed',
-            camLocked === null ? 'pkd-warn' : camLocked ? 'pkd-ok' : 'pkd-warn'
+            camLocked ? 'locked' : 'allowed',
+            camLocked ? 'pkd-ok' : 'pkd-warn'
         );
         this._micLockRow.setValue(
-            micLocked === null ? 'n/a' : micLocked ? 'locked' : 'allowed',
-            micLocked === null ? 'pkd-warn' : micLocked ? 'pkd-ok' : 'pkd-warn'
+            micLocked ? 'locked' : 'allowed',
+            micLocked ? 'pkd-ok' : 'pkd-warn'
         );
 
         const vpn = this._vpnActive();
@@ -439,16 +385,8 @@ class PrivacyKillIndicator extends PanelMenu.Button {
         );
 
         let netOn = true;
-        if (this._nmClient) {
-            try {
-                if (typeof this._nmClient.networking_get_enabled === 'function')
-                    netOn = !!this._nmClient.networking_get_enabled();
-                else
-                    netOn = !!this._nmClient.networking_enabled;
-            } catch {
-                netOn = true;
-            }
-        }
+        if (this._nmClient)
+            netOn = this._nmClient.networking_get_enabled();
 
         if (this._cfg.killSwitchArmed) {
             this._ksRow.setValue(
@@ -487,28 +425,17 @@ class PrivacyKillIndicator extends PanelMenu.Button {
 }
 
 export default class PrivacyKillDashboardExtension extends Extension {
-    _addToPanel(role, indicator) {
-        const existing = Main.panel.statusArea[role];
-        if (existing) {
-            try {
-                existing.destroy();
-            } catch {
-                // ignore
-            }
-            if (Main.panel.statusArea[role])
-                delete Main.panel.statusArea[role];
-        }
-        Main.panel.addToStatusArea(role, indicator);
-    }
 
     enable() {
         this._indicator = new PrivacyKillIndicator();
-        this._addToPanel(this.uuid, this._indicator);
+        Main.panel.addToStatusArea(this.uuid, this._indicator);
         this._indicator.start().catch(e => logError(e));
     }
 
     disable() {
-        this._indicator?.destroy();
-        this._indicator = null;
+        if (this._indicator) {
+            this._indicator.destroy();
+            this._indicator = null;
+        }
     }
 }
