@@ -281,7 +281,7 @@ class PrivacyKillIndicator extends PanelMenu.Button {
 
     destroy() {
         if (this._pollSource) {
-            GLib.Source.remove(this._pollSource);
+            try { GLib.Source.remove(this._pollSource); } catch { /* already removed */ }
             this._pollSource = 0;
         }
         if (this._mixerControl && this._streamChangedId) {
@@ -510,16 +510,17 @@ export default class PrivacyKillDashboardExtension extends Extension {
      * @param {import('resource:///org/gnome/shell/ui/panelMenu.js').Button} indicator
      */
     _addToPanel(role, indicator) {
-        try {
-            Main.panel.addToStatusArea(role, indicator);
-        } catch {
+        const existing = Main.panel.statusArea[role];
+        if (existing) {
             try {
-                Main.panel.statusArea[role]?.destroy();
+                existing.destroy();
             } catch {
                 // ignore
             }
-            Main.panel.addToStatusArea(role, indicator);
+            if (Main.panel.statusArea[role])
+                delete Main.panel.statusArea[role];
         }
+        Main.panel.addToStatusArea(role, indicator);
     }
 
     enable() {
