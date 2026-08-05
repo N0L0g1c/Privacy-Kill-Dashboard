@@ -2,6 +2,8 @@
 
 GNOME Shell extension: top-panel **privacy status board** for microphone mute, camera/mic privacy locks, and an optional soft VPN kill-switch.
 
+![Screenshot](screenshots/screenshot.png)
+
 ## Features
 
 - Panel summary: `OK`, or flags such as `MIC`, `CAM`, `KS`, `NET×`
@@ -15,7 +17,7 @@ GNOME Shell extension: top-panel **privacy status board** for microphone mute, c
 - GNOME Shell **45–50**
 - NetworkManager (for VPN detection and soft kill-switch)
 
-## Install (local)
+## Install
 
 ```bash
 UUID=privacy-kill-dashboard@n0l0g1c.github.io
@@ -24,7 +26,7 @@ cp -a "$UUID" ~/.local/share/gnome-shell/extensions/
 gnome-extensions enable "$UUID"
 ```
 
-On Wayland, log out and back in so the shell discovers a newly copied UUID, then enable it.
+Log out/in on Wayland (or restart GNOME Shell) so the extension is discovered.
 
 ## Configuration
 
@@ -39,37 +41,32 @@ Optional: `~/.config/privacy-kill-dashboard/settings.json`
 ## Limits
 
 - Privacy locks are the same settings as **Settings → Privacy**.
-- Kill-switch is **soft** (NM networking off). It is not a kernel/nftables kill-switch. Prefer your VPN client’s hard kill-switch for threat models that need it.
+- Kill-switch is **soft** (NM networking off). It is not a kernel/nftables kill-switch. Prefer your VPN client’s hard kill-switch when that threat model requires it.
 
-## Publish to extensions.gnome.org
+## Screenshots
 
-This project follows the [EGO review guidelines](https://gjs.guide/extensions/review-guidelines/review-guidelines.html):
-
-| Requirement | How this extension complies |
+| File | Contents |
 |---|---|
-| GPL-compatible license | GPL-2.0-or-later (`LICENSE`) |
-| `enable()` / `disable()` lifecycle | Objects, signals, and timeouts only while enabled; cleaned up in `disable()` |
-| No work before `enable()` | `Extension` class only constructs the indicator in `enable()` |
-| Honest `metadata.json` | UUID `name@namespace`, `shell-version` stable only, network/privacy behavior described |
-| No telemetry | No analytics |
-| No bundled binaries | Uses system NetworkManager and Shell mixer APIs only |
-| Zip contents | Only files needed to run (see below) |
+| [`screenshots/screenshot.png`](screenshots/screenshot.png) | Primary store image — armed kill-switch, locks on |
+| [`screenshots/screenshot-alert.png`](screenshots/screenshot-alert.png) | Alert state — mic live, locks open |
+| [`screenshots/icon.png`](screenshots/icon.png) | Optional icon asset |
 
-### Package for upload
+## Packaging
+
+Package only the extension runtime files (EGO zip must have `metadata.json` at the root):
 
 ```bash
 ./pack.sh
-# produces: privacy-kill-dashboard@n0l0g1c.github.io.shell-extension.zip
+# → privacy-kill-dashboard@n0l0g1c.github.io.shell-extension.zip
 ```
 
-The zip root **must** contain `metadata.json` (contents of the UUID directory only — not the git repo root).
+Zip contents: `metadata.json`, `extension.js`, `stylesheet.css`, `LICENSE`.
 
-Upload at [extensions.gnome.org](https://extensions.gnome.org/) after creating an account. Reviewers check security and guideline compliance, not full product QA.
+This project follows the [GNOME Shell extension review guidelines](https://gjs.guide/extensions/review-guidelines/review-guidelines.html) (lifecycle cleanup, GPL-2.0-or-later, honest metadata, no telemetry, no bundled binaries).
 
 ## Development
 
 ```bash
-# after editing, reinstall and reload
 cp -a privacy-kill-dashboard@n0l0g1c.github.io \
   ~/.local/share/gnome-shell/extensions/
 # X11: Alt+F2 → r → Enter
