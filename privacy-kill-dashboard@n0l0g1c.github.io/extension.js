@@ -1,4 +1,3 @@
-// Privacy Kill Dashboard — mic/cam privacy locks + VPN soft kill-switch
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 import Clutter from 'gi://Clutter';
@@ -18,290 +17,219 @@ Gio._promisify(Gio.File.prototype, 'load_contents_async', 'load_contents_finish'
 Gio._promisify(Gio.File.prototype, 'replace_contents_async', 'replace_contents_finish');
 
 const POLL_MS = 2000;
-const CONFIG_DIR = 'privacy-kill-dashboard';
-const CONFIG_FILE = 'settings.json';
+const CFG = GLib.build_filenamev([
+    GLib.get_user_config_dir(), 'privacy-kill-dashboard', 'settings.json',
+]);
 
-function configPath() {
-    return GLib.build_filenamev([
-        GLib.get_user_config_dir(),
-        CONFIG_DIR,
-        CONFIG_FILE,
-    ]);
-}
+class Row extends PopupMenu.PopupBaseMenuItem {
+    static { GObject.registerClass(this); }
 
-function defaultConfig() {
-    return {killSwitchArmed: false};
-}
-
-async function loadConfig() {
-    const defaults = defaultConfig();
-    try {
-        const file = Gio.File.new_for_path(configPath());
-        if (!file.query_exists(null))
-            return defaults;
-        const [, bytes] = await file.load_contents_async(null);
-        const data = JSON.parse(new TextDecoder().decode(bytes));
-        return {killSwitchArmed: !!data.killSwitchArmed};
-    } catch {
-        return defaults;
-    }
-}
-
-async function saveConfig(cfg) {
-    try {
-        const file = Gio.File.new_for_path(configPath());
-        const dir = file.get_parent();
-        if (dir && !dir.query_exists(null))
-            dir.make_directory_with_parents(null);
-        await file.replace_contents_async(
-            new TextEncoder().encode(JSON.stringify(cfg, null, 2)),
-            null,
-            false,
-            Gio.FileCreateFlags.REPLACE_DESTINATION,
-            null
-        );
-    } catch (e) {
-        logError(e, 'Privacy Kill Dashboard: saveConfig failed');
-    }
-}
-
-class StatusRow extends PopupMenu.PopupBaseMenuItem {
-    static {
-        GObject.registerClass(this);
-    }
-
-    constructor(key, value, style = '') {
-        super({
-            reactive: false,
-            can_focus: false,
-            style_class: 'pkd-row',
-        });
-
-        this._key = new St.Label({
-            text: key,
+    constructor(label) {
+        super({reactive: false, can_focus: false, style_class: 'pkd-row'});
+        this.add_child(new St.Label({
+            text: label,
             y_align: Clutter.ActorAlign.CENTER,
             style_class: 'pkd-key',
-        });
-        this.add_child(this._key);
-
+        }));
         this._val = new St.Label({
-            text: value,
+            text: '…',
             y_align: Clutter.ActorAlign.CENTER,
-            style_class: `pkd-val ${style}`.trim(),
+            style_class: 'pkd-val',
             x_expand: true,
         });
         this.add_child(this._val);
     }
 
-    setValue(text, style = '') {
+    set(text, extra = '') {
         this._val.text = text;
-        this._val.style_class = `pkd-val ${style}`.trim();
+        this._val.style_class = extra ? `pkd-val ${extra}` : 'pkd-val';
     }
 }
 
-class PrivacyKillIndicator extends PanelMenu.Button {
-    static {
-        GObject.registerClass(this);
-    }
+class Indicator extends PanelMenu.Button {
+    static { GObject.registerClass(this); }
 
     constructor() {
         super(0.5, 'Privacy Kill Dashboard', false);
 
-        const box = new St.BoxLayout({
-            style_class: 'panel-status-menu-box',
-        });
-
-        this._panelIcon = new St.Icon({
+        const box = new St.BoxLayout({style_class: 'panel-status-menu-box'});
+        this._icon = new St.Icon({
             icon_name: 'security-high-symbolic',
             style_class: 'system-status-icon',
         });
-        box.add_child(this._panelIcon);
-
-        this._panelLabel = new St.Label({
+        this._label = new St.Label({
             text: 'Priv',
             y_align: Clutter.ActorAlign.CENTER,
             style_class: 'pkd-panel-label',
         });
-        box.add_child(this._panelLabel);
-
+        box.add_child(this._icon);
+        box.add_child(this._label);
         this.add_child(box);
 
-        this._cfg = defaultConfig();
+        this._armed = false;
         this._hadVpn = false;
-        this._pollSource = 0;
-        this._nmClient = null;
-        this._nmSignalIds = [];
-        this._privacy = null;
-        this._mixerControl = null;
-        this._inputStream = null;
-        this._streamChangedId = 0;
-        this._privacyChangedIds = [];
+        this._timer = 0;
+        this._nm = null;
+        this._nmIds = [];
+        this._privacyIds = [];
+        this._streamId = 0;
 
-        this._privacy = new Gio.Settings({
-            schema_id: 'org.gnome.desktop.privacy',
+        this._privacy = new Gio.Settings({schema_id: 'org.gnome.desktop.privacy'});
+        this._mixer = Volume.getMixerControl();
+        this._source = this._mixer.get_default_source();
+        this._streamId = this._mixer.connect('default-source-changed', () => {
+            this._source = this._mixer.get_default_source();
+            this._paint();
         });
 
-        this._mixerControl = Volume.getMixerControl();
-        this._inputStream = this._mixerControl.get_default_source();
-        this._streamChangedId = this._mixerControl.connect(
-            'default-source-changed',
-            () => {
-                this._inputStream = this._mixerControl.get_default_source();
-                this._refresh();
-            }
-        );
-
-        this._micRow = new StatusRow('Microphone', '…');
-        this._camRow = new StatusRow('Camera lock', '…');
-        this._micLockRow = new StatusRow('Mic lock', '…');
-        this._vpnRow = new StatusRow('VPN', '…');
-        this._ksRow = new StatusRow('Kill-switch', '…');
-
-        this.menu.addMenuItem(this._micRow);
-        this.menu.addMenuItem(this._camRow);
-        this.menu.addMenuItem(this._micLockRow);
-        this.menu.addMenuItem(this._vpnRow);
-        this.menu.addMenuItem(this._ksRow);
-
+        this._mic = new Row('Microphone');
+        this._cam = new Row('Camera lock');
+        this._micLock = new Row('Mic lock');
+        this._vpn = new Row('VPN');
+        this._ks = new Row('Kill-switch');
+        this.menu.addMenuItem(this._mic);
+        this.menu.addMenuItem(this._cam);
+        this.menu.addMenuItem(this._micLock);
+        this.menu.addMenuItem(this._vpn);
+        this.menu.addMenuItem(this._ks);
         this.menu.addMenuItem(new PopupMenu.PopupSeparatorMenuItem());
 
-        this._toggleMicItem = new PopupMenu.PopupMenuItem('Toggle mic mute');
-        this._toggleMicItem.connect('activate', () => this._toggleMicMute());
-        this.menu.addMenuItem(this._toggleMicItem);
+        const mute = new PopupMenu.PopupMenuItem('Toggle mic mute');
+        mute.connect('activate', () => this._toggleMute());
+        this.menu.addMenuItem(mute);
 
-        this._toggleCamLock = new PopupMenu.PopupMenuItem('Toggle camera privacy lock');
-        this._toggleCamLock.connect('activate', () =>
-            this._togglePrivacyKey('disable-camera'));
-        this.menu.addMenuItem(this._toggleCamLock);
+        const cam = new PopupMenu.PopupMenuItem('Toggle camera lock');
+        cam.connect('activate', () => this._flipPrivacy('disable-camera'));
+        this.menu.addMenuItem(cam);
 
-        this._toggleMicLock = new PopupMenu.PopupMenuItem('Toggle microphone privacy lock');
-        this._toggleMicLock.connect('activate', () =>
-            this._togglePrivacyKey('disable-microphone'));
-        this.menu.addMenuItem(this._toggleMicLock);
-
+        const micLock = new PopupMenu.PopupMenuItem('Toggle microphone lock');
+        micLock.connect('activate', () => this._flipPrivacy('disable-microphone'));
+        this.menu.addMenuItem(micLock);
         this.menu.addMenuItem(new PopupMenu.PopupSeparatorMenuItem());
 
-        this._armItem = new PopupMenu.PopupMenuItem(this._armLabel());
-        this._armItem.connect('activate', () => {
-            this._cfg.killSwitchArmed = !this._cfg.killSwitchArmed;
-            saveConfig(this._cfg).catch(e => logError(e));
-            this._armItem.label.text = this._armLabel();
-            this._refresh();
-            if (this._cfg.killSwitchArmed) {
+        this._arm = new PopupMenu.PopupMenuItem(this._armText());
+        this._arm.connect('activate', () => {
+            this._armed = !this._armed;
+            this._save();
+            this._arm.label.text = this._armText();
+            this._paint();
+            if (this._armed) {
                 Main.notify(
                     'Privacy Kill Dashboard',
-                    'Kill-switch armed. If the VPN drops, networking will be disabled.'
+                    'Kill-switch armed. Networking disables if VPN drops.'
                 );
             }
         });
-        this.menu.addMenuItem(this._armItem);
+        this.menu.addMenuItem(this._arm);
 
-        this._cutNetItem = new PopupMenu.PopupMenuItem('Disable networking now');
-        this._cutNetItem.connect('activate', () => this._setNetworking(false));
-        this.menu.addMenuItem(this._cutNetItem);
+        const cut = new PopupMenu.PopupMenuItem('Disable networking now');
+        cut.connect('activate', () => this._setNet(false));
+        this.menu.addMenuItem(cut);
 
-        this._enableNetItem = new PopupMenu.PopupMenuItem('Enable networking');
-        this._enableNetItem.connect('activate', () => this._setNetworking(true));
-        this.menu.addMenuItem(this._enableNetItem);
+        const enable = new PopupMenu.PopupMenuItem('Enable networking');
+        enable.connect('activate', () => this._setNet(true));
+        this.menu.addMenuItem(enable);
 
-        this.menu.addMenuItem(new PopupMenu.PopupSeparatorMenuItem());
+        this._note = new PopupMenu.PopupMenuItem('Ready', {reactive: false, can_focus: false});
+        this._note.label.add_style_class_name('pkd-status');
+        this.menu.addMenuItem(this._note);
 
-        const hint = new PopupMenu.PopupMenuItem(
-            'Locks use GNOME Privacy settings. Kill-switch is soft (NM).',
-            {reactive: false, can_focus: false}
-        );
-        hint.label.add_style_class_name('pkd-hint');
-        this.menu.addMenuItem(hint);
-
-        this._statusItem = new PopupMenu.PopupMenuItem('Ready', {
-            reactive: false,
-            can_focus: false,
-        });
-        this._statusItem.label.add_style_class_name('pkd-status');
-        this.menu.addMenuItem(this._statusItem);
-
-        if (this._privacy) {
-            for (const key of ['disable-camera', 'disable-microphone']) {
-                const id = this._privacy.connect(`changed::${key}`, () => this._refresh());
-                this._privacyChangedIds.push(id);
-            }
-        }
+        for (const key of ['disable-camera', 'disable-microphone'])
+            this._privacyIds.push(
+                this._privacy.connect(`changed::${key}`, () => this._paint())
+            );
     }
 
-    _armLabel() {
-        return this._cfg.killSwitchArmed
-            ? 'Disarm VPN kill-switch'
-            : 'Arm VPN kill-switch';
+    _armText() {
+        return this._armed ? 'Disarm VPN kill-switch' : 'Arm VPN kill-switch';
     }
 
     async start() {
-        this._cfg = await loadConfig();
-        this._armItem.label.text = this._armLabel();
-
         try {
-            this._nmClient = await NM.Client.new_async(null);
-            this._nmSignalIds.push(
-                this._nmClient.connect('notify::active-connections', () => this._onNmChange())
-            );
-            this._nmSignalIds.push(
-                this._nmClient.connect('notify::networking-enabled', () => this._refresh())
-            );
-        } catch (e) {
-            logError(e, 'Privacy Kill Dashboard: NetworkManager unavailable');
-            this._statusItem.label.text = 'NetworkManager unavailable';
+            const file = Gio.File.new_for_path(CFG);
+            if (file.query_exists(null)) {
+                const [, bytes] = await file.load_contents_async(null);
+                const data = JSON.parse(new TextDecoder().decode(bytes));
+                this._armed = !!data.killSwitchArmed;
+                this._arm.label.text = this._armText();
+            }
+        } catch {
+            // defaults
         }
 
-        this._hadVpn = this._vpnActive();
-        this._refresh();
+        try {
+            this._nm = await NM.Client.new_async(null);
+            this._nmIds.push(
+                this._nm.connect('notify::active-connections', () => this._onNm())
+            );
+            this._nmIds.push(
+                this._nm.connect('notify::networking-enabled', () => this._paint())
+            );
+        } catch (e) {
+            logError(e, 'Privacy Kill Dashboard: NM unavailable');
+            this._note.label.text = 'NetworkManager unavailable';
+        }
 
-        this._pollSource = GLib.timeout_add(GLib.PRIORITY_DEFAULT, POLL_MS, () => {
-            this._onNmChange();
-            this._refresh();
+        this._hadVpn = this._vpnUp();
+        this._paint();
+        this._timer = GLib.timeout_add(GLib.PRIORITY_DEFAULT, POLL_MS, () => {
+            this._onNm();
+            this._paint();
             return GLib.SOURCE_CONTINUE;
         });
     }
 
     destroy() {
-        if (this._pollSource) {
-            GLib.Source.remove(this._pollSource);
-            this._pollSource = 0;
+        if (this._timer) {
+            GLib.Source.remove(this._timer);
+            this._timer = 0;
         }
-        if (this._mixerControl && this._streamChangedId) {
-            this._mixerControl.disconnect(this._streamChangedId);
-            this._streamChangedId = 0;
+        if (this._streamId) {
+            this._mixer.disconnect(this._streamId);
+            this._streamId = 0;
         }
-        if (this._privacy) {
-            for (const id of this._privacyChangedIds)
-                this._privacy.disconnect(id);
-            this._privacyChangedIds = [];
+        for (const id of this._privacyIds)
+            this._privacy.disconnect(id);
+        this._privacyIds = [];
+        if (this._nm) {
+            for (const id of this._nmIds)
+                this._nm.disconnect(id);
+            this._nmIds = [];
+            this._nm = null;
         }
-        if (this._nmClient) {
-            for (const id of this._nmSignalIds)
-                this._nmClient.disconnect(id);
-            this._nmSignalIds = [];
-        }
-        this._nmClient = null;
-        this._mixerControl = null;
-        this._inputStream = null;
+        this._mixer = null;
+        this._source = null;
         this._privacy = null;
         super.destroy();
     }
 
-    _vpnActive() {
-        if (!this._nmClient)
-            return false;
+    async _save() {
+        try {
+            const file = Gio.File.new_for_path(CFG);
+            const dir = file.get_parent();
+            if (dir && !dir.query_exists(null))
+                dir.make_directory_with_parents(null);
+            await file.replace_contents_async(
+                new TextEncoder().encode(JSON.stringify({killSwitchArmed: this._armed}, null, 2)),
+                null, false, Gio.FileCreateFlags.REPLACE_DESTINATION, null
+            );
+        } catch (e) {
+            logError(e, 'Privacy Kill Dashboard: save failed');
+        }
+    }
 
-        for (const ac of this._nmClient.get_active_connections()) {
+    _vpnUp() {
+        if (!this._nm)
+            return false;
+        for (const ac of this._nm.get_active_connections()) {
             const type = ac.get_connection_type() || '';
             if (type === 'vpn' || type === 'wireguard' || type.includes('vpn'))
                 return true;
             const id = (ac.get_id() || '').toLowerCase();
-            if (id.includes('vpn') || id.includes('wireguard') || id.includes('wg-') ||
-                id.includes('tailscale') || id.includes('mullvad') || id.includes('proton'))
+            if (id.includes('vpn') || id.includes('wireguard') || id.includes('tailscale'))
                 return true;
         }
-
-        for (const dev of this._nmClient.get_devices()) {
+        for (const dev of this._nm.get_devices()) {
             if (dev.get_state() !== NM.DeviceState.ACTIVATED)
                 continue;
             const iface = dev.get_iface() || '';
@@ -311,131 +239,104 @@ class PrivacyKillIndicator extends PanelMenu.Button {
         return false;
     }
 
-    _onNmChange() {
-        const vpn = this._vpnActive();
-        if (this._cfg.killSwitchArmed && this._hadVpn && !vpn)
-            this._triggerKillSwitch();
-        this._hadVpn = vpn;
+    _onNm() {
+        const up = this._vpnUp();
+        if (this._armed && this._hadVpn && !up) {
+            Main.notify('Privacy Kill Dashboard', 'VPN dropped — networking disabled');
+            this._setNet(false);
+            this._note.label.text = 'Kill-switch fired';
+        }
+        this._hadVpn = up;
     }
 
-    _triggerKillSwitch() {
-        Main.notify(
-            'Privacy Kill Dashboard',
-            'VPN dropped — disabling networking (kill-switch).'
-        );
-        this._setNetworking(false);
-        this._statusItem.label.text = 'Kill-switch fired — networking disabled';
-    }
-
-    _setNetworking(enabled) {
-        if (!this._nmClient) {
+    _setNet(on) {
+        if (!this._nm) {
             Main.notify('Privacy Kill Dashboard', 'NetworkManager not available');
             return;
         }
-        this._nmClient.networking_set_enabled(enabled);
-        this._statusItem.label.text = enabled
-            ? 'Networking enabled'
-            : 'Networking disabled';
-        this._refresh();
+        this._nm.networking_set_enabled(on);
+        this._note.label.text = on ? 'Networking enabled' : 'Networking disabled';
+        this._paint();
     }
 
-    _toggleMicMute() {
-        const stream = this._inputStream || this._mixerControl.get_default_source();
+    _toggleMute() {
+        const stream = this._source || this._mixer.get_default_source();
         if (!stream) {
-            Main.notify('Privacy Kill Dashboard', 'No input device found');
+            Main.notify('Privacy Kill Dashboard', 'No input device');
             return;
         }
         stream.change_is_muted(!stream.is_muted);
-        this._refresh();
+        this._paint();
     }
 
-    _togglePrivacyKey(key) {
-        const cur = this._privacy.get_boolean(key);
-        this._privacy.set_boolean(key, !cur);
-        this._refresh();
+    _flipPrivacy(key) {
+        this._privacy.set_boolean(key, !this._privacy.get_boolean(key));
+        this._paint();
     }
 
-    _refresh() {
-        const stream = this._inputStream || this._mixerControl.get_default_source();
-        const micMuted = stream ? !!stream.is_muted : null;
-
-        if (micMuted === null)
-            this._micRow.setValue('unknown', 'pkd-warn');
-        else if (micMuted)
-            this._micRow.setValue('muted', 'pkd-ok');
+    _paint() {
+        const stream = this._source || this._mixer.get_default_source();
+        const muted = stream ? !!stream.is_muted : null;
+        if (muted === null)
+            this._mic.set('unknown', 'pkd-warn');
+        else if (muted)
+            this._mic.set('muted', 'pkd-ok');
         else
-            this._micRow.setValue('live (unmuted)', 'pkd-danger');
+            this._mic.set('live', 'pkd-danger');
 
-        const camLocked = this._privacy.get_boolean('disable-camera');
-        const micLocked = this._privacy.get_boolean('disable-microphone');
+        const camOff = this._privacy.get_boolean('disable-camera');
+        const micOff = this._privacy.get_boolean('disable-microphone');
+        this._cam.set(camOff ? 'locked' : 'allowed', camOff ? 'pkd-ok' : 'pkd-warn');
+        this._micLock.set(micOff ? 'locked' : 'allowed', micOff ? 'pkd-ok' : 'pkd-warn');
 
-        this._camRow.setValue(
-            camLocked ? 'locked' : 'allowed',
-            camLocked ? 'pkd-ok' : 'pkd-warn'
-        );
-        this._micLockRow.setValue(
-            micLocked ? 'locked' : 'allowed',
-            micLocked ? 'pkd-ok' : 'pkd-warn'
-        );
-
-        const vpn = this._vpnActive();
-        this._vpnRow.setValue(
-            vpn ? 'connected' : 'down',
-            vpn ? 'pkd-ok' : 'pkd-warn'
-        );
+        const vpn = this._vpnUp();
+        this._vpn.set(vpn ? 'connected' : 'down', vpn ? 'pkd-ok' : 'pkd-warn');
 
         let netOn = true;
-        if (this._nmClient)
-            netOn = this._nmClient.networking_get_enabled();
+        if (this._nm)
+            netOn = this._nm.networking_get_enabled();
 
-        if (this._cfg.killSwitchArmed) {
-            this._ksRow.setValue(
-                netOn ? 'ARMED' : 'ARMED · net OFF',
-                'pkd-armed'
-            );
-        } else {
-            this._ksRow.setValue(netOn ? 'disarmed' : 'disarmed · net OFF', '');
-        }
-        this._armItem.label.text = this._armLabel();
+        if (this._armed)
+            this._ks.set(netOn ? 'ARMED' : 'ARMED · net OFF', 'pkd-armed');
+        else
+            this._ks.set(netOn ? 'disarmed' : 'disarmed · net OFF');
+        this._arm.label.text = this._armText();
 
-        const bits = [];
-        if (micMuted === false)
-            bits.push('MIC');
-        if (camLocked === false)
-            bits.push('CAM');
-        if (this._cfg.killSwitchArmed)
-            bits.push(vpn ? 'KS' : 'KS!');
+        const flags = [];
+        if (muted === false)
+            flags.push('MIC');
+        if (!camOff)
+            flags.push('CAM');
+        if (this._armed)
+            flags.push(vpn ? 'KS' : 'KS!');
         if (!netOn)
-            bits.push('NET×');
+            flags.push('NET×');
 
-        if (bits.length === 0) {
-            this._panelLabel.text = 'OK';
-            this._panelLabel.style_class = 'pkd-panel-label pkd-ok';
-            this._panelIcon.icon_name = 'security-high-symbolic';
-        } else if (bits.includes('KS!') || bits.includes('MIC')) {
-            this._panelLabel.text = bits.join('·');
-            this._panelLabel.style_class = 'pkd-panel-label pkd-danger';
-            this._panelIcon.icon_name = 'security-low-symbolic';
+        if (!flags.length) {
+            this._label.text = 'OK';
+            this._label.style_class = 'pkd-panel-label pkd-ok';
+            this._icon.icon_name = 'security-high-symbolic';
+        } else if (flags.includes('KS!') || flags.includes('MIC')) {
+            this._label.text = flags.join('·');
+            this._label.style_class = 'pkd-panel-label pkd-danger';
+            this._icon.icon_name = 'security-low-symbolic';
         } else {
-            this._panelLabel.text = bits.join('·');
-            this._panelLabel.style_class = 'pkd-panel-label pkd-warn';
-            this._panelIcon.icon_name = 'security-medium-symbolic';
+            this._label.text = flags.join('·');
+            this._label.style_class = 'pkd-panel-label pkd-warn';
+            this._icon.icon_name = 'security-medium-symbolic';
         }
     }
 }
 
 export default class PrivacyKillDashboardExtension extends Extension {
-
     enable() {
-        this._indicator = new PrivacyKillIndicator();
+        this._indicator = new Indicator();
         Main.panel.addToStatusArea(this.uuid, this._indicator);
         this._indicator.start().catch(e => logError(e));
     }
 
     disable() {
-        if (this._indicator) {
-            this._indicator.destroy();
-            this._indicator = null;
-        }
+        this._indicator.destroy();
+        this._indicator = null;
     }
 }
