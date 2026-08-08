@@ -1,14 +1,7 @@
 {
   "uuid": "privacy-kill-dashboard@n0l0g1c.github.io",
   "name": "Privacy Kill Dashboard",
-  "description": "Panel status for microphone mute, camera and microphone privacy locks (GNOME Privacy settings), and an optional soft VPN kill-switch.\n\nWhen the kill-switch is armed and a VPN, WireGuard, or Tailscale connection drops, NetworkManager networking is disabled. This is a soft kill-switch, not a kernel firewall rule.\n\nUses NetworkManager D-Bus only. No telemetry and no remote network requests.",
-  "shell-version": [
-    "45",
-    "46",
-    "47",
-    "48",
-    "49",
-    "50"
-  ],
+  "description": "Panel controls for mic mute, GNOME camera/mic privacy locks, and an optional soft VPN kill-switch (disables NetworkManager networking if VPN drops).",
+  "shell-version": ["45", "46", "47", "48", "49", "50"],
   "url": "https://github.com/N0L0g1c/Privacy-Kill-Dashboard"
 }
